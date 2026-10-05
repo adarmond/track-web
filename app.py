@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import hmac
+import hashlib
+from io import BytesIO
 import requests
 from pathlib import Path
 from typing import Any
@@ -51,32 +53,68 @@ def require_access() -> None:
     st.stop()
 
 
-@st.cache_resource(show_spinner=False)
-def sync_private_web_data() -> bool:
+def supabase_settings() -> tuple[str, str, str]:
     try:
         url = str(st.secrets["SUPABASE_URL"]).rstrip("/")
         key = str(st.secrets["SUPABASE_SERVICE_ROLE_KEY"])
         bucket = str(st.secrets.get("SUPABASE_BUCKET", "recruiting-web"))
+        return url, key, bucket
     except Exception as exc:
         st.error(f"Supabase secrets are not configured: {exc}")
         st.stop()
 
+
+def storage_headers() -> dict[str, str]:
+    _, key, _ = supabase_settings()
+    return {"Authorization": f"Bearer {key}", "apikey": key}
+
+
+def download_private_object(object_path: str) -> bytes:
+    url, _, bucket = supabase_settings()
+    endpoint = f"{url}/storage/v1/object/authenticated/{bucket}/{object_path}"
+    response = requests.get(endpoint, headers=storage_headers(), timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(f"{object_path} returned HTTP {response.status_code}")
+    return response.content
+
+
+def upload_private_object(object_path: str, payload: bytes, content_type: str) -> None:
+    url, _, bucket = supabase_settings()
+    endpoint = f"{url}/storage/v1/object/{bucket}/{object_path}"
+    headers = storage_headers() | {
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+    response = requests.post(endpoint, headers=headers, data=payload, timeout=30)
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"Could not save {object_path} to private storage "
+            f"(HTTP {response.status_code}): {response.text[:300]}"
+        )
+
+
+def sync_private_web_data() -> bool:
     files = {
         "data/athletes.csv": ROOT / "data" / "athletes.csv",
         "data/performance_history.csv": ROOT / "data" / "performance_history.csv",
         "data/recruiting_intelligence_snapshot.json": ROOT / "data" / "recruiting_intelligence_snapshot.json",
         "reports/weekly_track_report.xlsx": ROOT / "reports" / "weekly_track_report.xlsx",
     }
-    headers = {"Authorization": f"Bearer {key}", "apikey": key}
     for object_path, local_path in files.items():
-        endpoint = f"{url}/storage/v1/object/authenticated/{bucket}/{object_path}"
-        response = requests.get(endpoint, headers=headers, timeout=30)
-        if response.status_code != 200:
-            st.error(f"Could not load private recruiting data: {object_path} ({response.status_code})")
+        try:
+            payload = download_private_object(object_path)
+        except Exception as exc:
+            st.error(f"Could not load private recruiting data: {exc}")
             st.stop()
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_bytes(response.content)
+        local_path.write_bytes(payload)
     return True
+
+
+def refresh_private_web_data() -> None:
+    load_history.clear()
+    load_athletes.clear()
+    sync_private_web_data()
 
 
 require_access()
@@ -107,6 +145,98 @@ def clean(v: Any) -> str:
         pass
     return str(v).strip()
 
+
+def normalize_header(value: Any) -> str:
+    return clean(value).casefold().replace("_", " ").strip()
+
+
+def find_upload_column(df: pd.DataFrame, names: list[str]) -> str | None:
+    lookup = {normalize_header(c): c for c in df.columns}
+    for name in names:
+        hit = lookup.get(normalize_header(name))
+        if hit is not None:
+            return hit
+    return None
+
+
+def stable_web_athlete_id(name: str, school: str) -> str:
+    raw = f"{name.strip().casefold()}|{school.strip().casefold()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def parse_roster_excel(file_bytes: bytes) -> pd.DataFrame:
+    raw = pd.read_excel(BytesIO(file_bytes), dtype=str).fillna("")
+    name_col = find_upload_column(raw, ["Name", "Athlete", "Player", "Player Name", "Athlete Name"])
+    if name_col is None:
+        raise ValueError("The workbook needs a Name column.")
+
+    school_col = find_upload_column(raw, ["School", "High School", "HS"])
+    position_col = find_upload_column(raw, ["Position", "Pos"])
+    state_col = find_upload_column(raw, ["State", "ST"])
+
+    out = pd.DataFrame()
+    out["Name"] = raw[name_col].astype(str).str.strip()
+    out["School"] = raw[school_col].astype(str).str.strip() if school_col else ""
+    out["Position"] = raw[position_col].astype(str).str.strip() if position_col else ""
+    out["State"] = raw[state_col].astype(str).str.strip() if state_col else ""
+    out = out[out["Name"] != ""].copy()
+    out = out.drop_duplicates(subset=["Name", "School"], keep="first").reset_index(drop=True)
+    return out
+
+
+def merge_uploaded_roster(existing_raw: pd.DataFrame, incoming: pd.DataFrame) -> tuple[pd.DataFrame, int, int]:
+    existing = normalize_athletes(existing_raw)
+    existing_lookup: dict[tuple[str, str], str] = {}
+    for _, row in existing.iterrows():
+        key = (clean(row["Name"]).casefold(), clean(row["School"]).casefold())
+        if key[0]:
+            existing_lookup[key] = clean(row["Athlete ID"])
+
+    rows = []
+    new_count = 0
+    existing_count = 0
+    for _, row in incoming.iterrows():
+        name = clean(row["Name"])
+        school = clean(row["School"])
+        key = (name.casefold(), school.casefold())
+        athlete_id = existing_lookup.get(key, "")
+        if athlete_id:
+            existing_count += 1
+        else:
+            athlete_id = stable_web_athlete_id(name, school)
+            new_count += 1
+        rows.append({
+            "Athlete ID": athlete_id,
+            "Name": name,
+            "School": school,
+            "Position": clean(row["Position"]),
+            "State": clean(row["State"]),
+        })
+
+    # Step 9.3 treats the uploaded workbook as the current recruiting roster.
+    merged = pd.DataFrame(rows, columns=["Athlete ID", "Name", "School", "Position", "State"])
+    return merged, new_count, existing_count
+
+
+def roster_master_xlsx(roster: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    master = roster[["Position", "Name", "School", "State"]].copy()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        master.to_excel(writer, index=False, sheet_name="Sheet1")
+    return output.getvalue()
+
+
+def save_roster_to_private_storage(roster: pd.DataFrame) -> None:
+    csv_bytes = roster.to_csv(index=False).encode("utf-8")
+    xlsx_bytes = roster_master_xlsx(roster)
+    upload_private_object("data/athletes.csv", csv_bytes, "text/csv")
+    upload_private_object(
+        "inputs/2026 Nevada Track.xlsx",
+        xlsx_bytes,
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    (DATA_DIR / "athletes.csv").write_bytes(csv_bytes)
+    load_athletes.clear()
 
 def find_athlete_file() -> Path | None:
     candidates = [
@@ -255,14 +385,14 @@ alerts = snapshot_alerts(payload)
 
 with st.sidebar:
     st.markdown("### Nevada Football")
-    st.caption("Recruiting Intelligence · Step 9.1")
+    st.caption("Recruiting Intelligence · Step 9.3")
     if "_next_workspace" in st.session_state:
         st.session_state["workspace"] = st.session_state.pop("_next_workspace")
     if "workspace" not in st.session_state:
         st.session_state["workspace"] = "Operations"
     page = st.radio(
         "Workspace",
-        ["Operations", "Recruiting Board", "Player Profiles", "Position Rooms", "Weekly Alerts", "Performance History"],
+        ["Operations", "Recruiting Board", "Player Profiles", "Position Rooms", "Weekly Alerts", "Performance History", "Manage Athletes"],
         label_visibility="collapsed", key="workspace",
     )
     st.divider()
@@ -270,7 +400,7 @@ with st.sidebar:
     position_filter = st.multiselect("Position filter", positions)
     states = sorted([x for x in athletes["State"].unique().tolist() if clean(x)])
     state_filter = st.multiselect("State filter", states)
-    st.caption("Read-only web layer. The Step 8.4 tracker remains the source of truth.")
+    st.caption("Step 9.3 web operations. Verified performance history remains protected by the stable tracker pipeline.")
 
 filtered = athletes.copy()
 if position_filter:
@@ -394,6 +524,92 @@ elif page == "Weekly Alerts":
         st.dataframe(pd.DataFrame(alerts), use_container_width=True, hide_index=True)
     else:
         st.success("No new recruiting alerts in the current snapshot.")
+
+elif page == "Manage Athletes":
+    st.subheader("Manage Athletes")
+    st.caption(
+        "Upload an Excel recruiting roster. The workbook is stored only in private Supabase storage; "
+        "it is never committed to the public GitHub repository."
+    )
+
+    with st.container(border=True):
+        st.markdown("### Upload recruiting roster")
+        st.write("Required: **Name**. Recommended for reliable result matching: **School, Position, State**.")
+        st.caption(
+            "Accepted column names include Name/Athlete/Player, School/High School, Position/Pos, and State/ST."
+        )
+        uploaded = st.file_uploader("Excel roster", type=["xlsx"], accept_multiple_files=False)
+
+        if uploaded is not None:
+            try:
+                incoming = parse_roster_excel(uploaded.getvalue())
+                proposed, new_count, existing_count = merge_uploaded_roster(athletes_raw, incoming)
+
+                missing_school = int((proposed["School"].astype(str).str.strip() == "").sum())
+                missing_position = int((proposed["Position"].astype(str).str.strip() == "").sum())
+                missing_state = int((proposed["State"].astype(str).str.strip() == "").sum())
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Athletes detected", len(proposed))
+                c2.metric("New athletes", new_count)
+                c3.metric("Already tracked", existing_count)
+
+                if missing_school or missing_position or missing_state:
+                    st.warning(
+                        f"Missing fields — School: {missing_school}, Position: {missing_position}, "
+                        f"State: {missing_state}. Names-only uploads are allowed, but result discovery "
+                        "is much more reliable when School and State are included."
+                    )
+
+                st.dataframe(
+                    proposed[["Name", "School", "Position", "State"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.warning(
+                    "Importing replaces the CURRENT recruiting roster with this workbook. "
+                    "Verified performance history is not deleted."
+                )
+                confirm = st.checkbox(
+                    "I reviewed the roster and want this workbook to become the current recruiting roster."
+                )
+                if st.button(
+                    "Import Athletes",
+                    type="primary",
+                    disabled=not confirm or proposed.empty,
+                    use_container_width=True,
+                ):
+                    save_roster_to_private_storage(proposed)
+                    st.session_state["_roster_import_success"] = (
+                        f"Imported {len(proposed)} athletes. "
+                        f"{new_count} new, {existing_count} already tracked."
+                    )
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Could not read/import this workbook: {exc}")
+
+    if "_roster_import_success" in st.session_state:
+        st.success(st.session_state.pop("_roster_import_success"))
+
+    st.divider()
+    st.markdown("### Current private roster")
+    st.dataframe(
+        athletes[["Name", "School", "Position", "State"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.download_button(
+        "Download tracker master workbook",
+        data=roster_master_xlsx(athletes),
+        file_name="2026 Nevada Track.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="Use this file as the local tracker's master workbook until the tracker itself is moved into the web app.",
+    )
+    st.info(
+        "The web roster updates immediately. For the current local Step 8.4 result-discovery run, "
+        "download the tracker master workbook above and replace the local 2026 Nevada Track.xlsx before running py run_tracker.py."
+    )
 
 elif page == "Performance History":
     st.subheader("Verified Performance History")
