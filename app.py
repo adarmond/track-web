@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hmac
 import hashlib
+import unicodedata
 from io import BytesIO
 import requests
 from pathlib import Path
@@ -23,7 +24,7 @@ WEEKLY_REPORT = REPORTS_DIR / "weekly_track_report.xlsx"
 
 
 st.set_page_config(
-    page_title="Nevada Football Recruiting Intelligence",
+    page_title="Nevada Football Track",
     page_icon="🏈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -411,6 +412,48 @@ def athlete_history(history: pd.DataFrame, athlete_id: str, name: str) -> pd.Dat
 
 
 
+def normalized_identity_text(value: Any) -> str:
+    text = clean(value)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return " ".join(text.casefold().split())
+
+
+def athlete_identity_keys(row: pd.Series) -> set[str]:
+    keys: set[str] = set()
+    aid = normalized_identity_text(row.get("Athlete ID", ""))
+    name = normalized_identity_text(row.get("Name", ""))
+    school = normalized_identity_text(row.get("School", ""))
+    if aid:
+        keys.add(f"id:{aid}")
+    if name and school:
+        keys.add(f"name_school:{name}|{school}")
+    if name:
+        keys.add(f"name:{name}")
+    return keys
+
+
+def verified_identity_keys(history_df: pd.DataFrame) -> set[str]:
+    keys: set[str] = set()
+    for _, row in history_df.iterrows():
+        keys.update(athlete_identity_keys(row))
+    return keys
+
+
+def athlete_has_verified_history(row: pd.Series, history_keys: set[str]) -> bool:
+    keys = athlete_identity_keys(row)
+    strong = {k for k in keys if k.startswith("id:") or k.startswith("name_school:")}
+    if strong & history_keys:
+        return True
+    return bool({k for k in keys if k.startswith("name:")} & history_keys)
+
+
+def verified_athlete_ids(athlete_df: pd.DataFrame, history_df: pd.DataFrame) -> set[str]:
+    history_keys = verified_identity_keys(history_df)
+    return {clean(row.get("Athlete ID", "")) for _, row in athlete_df.iterrows()
+            if clean(row.get("Athlete ID", "")) and athlete_has_verified_history(row, history_keys)}
+
+
 def history_with_dates(history_df: pd.DataFrame) -> pd.DataFrame:
     out = history_df.copy()
     if out.empty:
@@ -465,25 +508,36 @@ def athlete_last_result_map(history_df: pd.DataFrame) -> dict[str, pd.Timestamp]
 
 
 def athlete_attention_rows(athlete_df: pd.DataFrame, history_df: pd.DataFrame) -> list[dict[str, str]]:
-    last_map = athlete_last_result_map(history_df)
+    history_keys = verified_identity_keys(history_df)
     dated = history_with_dates(history_df)
     latest_date = dated["_Date"].max() if not dated.empty else pd.NaT
     rows: list[dict[str, str]] = []
     for _, athlete in athlete_df.iterrows():
         aid = clean(athlete.get("Athlete ID", ""))
         name = clean(athlete.get("Name", ""))
-        key = aid or name.casefold()
-        last = last_map.get(key)
-        if last is None:
-            rows.append({
-                "Athlete ID": aid, "Name": name, "Position": clean(athlete.get("Position", "")),
-                "Reason": "No verified track evidence", "Last Result": "—"
-            })
-        elif pd.notna(latest_date) and (latest_date - last).days >= 30:
-            rows.append({
-                "Athlete ID": aid, "Name": name, "Position": clean(athlete.get("Position", "")),
-                "Reason": "No verified result in 30+ days", "Last Result": last.strftime("%Y-%m-%d")
-            })
+        name_norm = normalized_identity_text(name)
+        school_norm = normalized_identity_text(athlete.get("School", ""))
+        matches = dated.iloc[0:0]
+        if not dated.empty:
+            if aid and "Athlete ID" in dated.columns:
+                matches = dated[dated["Athlete ID"].map(normalized_identity_text) == normalized_identity_text(aid)]
+            if matches.empty and name_norm and "Name" in dated.columns:
+                nm = dated["Name"].map(normalized_identity_text) == name_norm
+                if school_norm and "School" in dated.columns:
+                    sm = dated["School"].map(normalized_identity_text) == school_norm
+                    strong = dated[nm & sm]
+                    if not strong.empty:
+                        matches = strong
+                if matches.empty:
+                    matches = dated[nm]
+        valid_dates = matches["_Date"].dropna() if not matches.empty else pd.Series(dtype="datetime64[ns]")
+        last = valid_dates.max() if not valid_dates.empty else pd.NaT
+        if not athlete_has_verified_history(athlete, history_keys):
+            rows.append({"Athlete ID": aid, "Name": name, "Position": clean(athlete.get("Position", "")),
+                         "Reason": "No verified track evidence", "Last Result": "—"})
+        elif pd.notna(last) and pd.notna(latest_date) and (latest_date - last).days >= 30:
+            rows.append({"Athlete ID": aid, "Name": name, "Position": clean(athlete.get("Position", "")),
+                         "Reason": "No verified result in 30+ days", "Last Result": last.strftime("%Y-%m-%d")})
     return rows
 
 
@@ -556,7 +610,7 @@ alerts = snapshot_alerts(payload)
 
 with st.sidebar:
     st.markdown("### Nevada Football")
-    st.caption("Recruiting Intelligence · Step 9.6")
+    st.caption("Recruiting Intelligence · Step 9.6.1")
     if "_next_workspace" in st.session_state:
         st.session_state["workspace"] = st.session_state.pop("_next_workspace")
     if "workspace" not in st.session_state:
@@ -571,7 +625,7 @@ with st.sidebar:
     position_filter = st.multiselect("Position filter", positions)
     states = sorted([x for x in athletes["State"].unique().tolist() if clean(x)])
     state_filter = st.multiselect("State filter", states)
-    st.caption("Step 9.6 recruiting operations. Verified performance history remains protected by the stable tracker pipeline.")
+    st.caption("Step 9.6.1 recruiting operations. Verified performance history remains protected by the stable tracker pipeline.")
 
 filtered = athletes.copy()
 if position_filter:
@@ -579,12 +633,7 @@ if position_filter:
 if state_filter:
     filtered = filtered[filtered["State"].isin(state_filter)]
 
-verified_ids = set()
-if "Athlete ID" in history.columns:
-    verified_ids = set(history["Athlete ID"].astype(str).tolist())
-elif "Name" in history.columns:
-    verified_names = set(history["Name"].astype(str).str.casefold().tolist())
-    verified_ids = set(athletes.loc[athletes["Name"].str.casefold().isin(verified_names), "Athlete ID"])
+verified_ids = verified_athlete_ids(athletes, history)
 
 st.markdown('<div class="nv-title">Nevada Football Recruiting Intelligence</div>', unsafe_allow_html=True)
 st.markdown('<div class="nv-sub">Track evidence, development and weekly recruiting operations.</div>', unsafe_allow_html=True)
@@ -625,7 +674,7 @@ if page == "Operations":
         else:
             for item in attention[:6]:
                 with st.container(border=True):
-                    x, y = st.columns([5, 1])
+                    x, y = st.columns([4, 1.6])
                     with x:
                         st.markdown(f"**{item['Name']}** · {item['Position']}")
                         st.caption(f"{item['Reason']} · Last result: {item['Last Result']}")
