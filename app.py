@@ -410,6 +410,110 @@ def athlete_history(history: pd.DataFrame, athlete_id: str, name: str) -> pd.Dat
     return pd.DataFrame()
 
 
+
+def history_with_dates(history_df: pd.DataFrame) -> pd.DataFrame:
+    out = history_df.copy()
+    if out.empty:
+        out["_Date"] = pd.Series(dtype="datetime64[ns]")
+        return out
+    if "Meet Date" in out.columns:
+        out["_Date"] = pd.to_datetime(out["Meet Date"], errors="coerce")
+    else:
+        out["_Date"] = pd.NaT
+    return out
+
+
+def truthy_flag(value: Any) -> bool:
+    return clean(value).casefold() in {"yes", "true", "1", "y", "pb", "sb"}
+
+
+def recent_verified_results(history_df: pd.DataFrame, limit: int = 8) -> pd.DataFrame:
+    out = history_with_dates(history_df)
+    if out.empty:
+        return out
+    return out.sort_values("_Date", ascending=False, na_position="last").head(limit)
+
+
+def recent_standouts(history_df: pd.DataFrame, limit: int = 6) -> pd.DataFrame:
+    """Recent verified PB/SB performances. No synthetic player grade is created."""
+    out = history_with_dates(history_df)
+    if out.empty:
+        return out
+    pb = out["PB"].map(truthy_flag) if "PB" in out.columns else pd.Series(False, index=out.index)
+    sb = out["SB"].map(truthy_flag) if "SB" in out.columns else pd.Series(False, index=out.index)
+    flagged = out[pb | sb].copy()
+    if flagged.empty:
+        return flagged
+    return flagged.sort_values("_Date", ascending=False, na_position="last").head(limit)
+
+
+def athlete_last_result_map(history_df: pd.DataFrame) -> dict[str, pd.Timestamp]:
+    out = history_with_dates(history_df)
+    result: dict[str, pd.Timestamp] = {}
+    if out.empty:
+        return result
+    for _, row in out.dropna(subset=["_Date"]).iterrows():
+        aid = clean(row.get("Athlete ID", ""))
+        name = clean(row.get("Name", "")).casefold()
+        key = aid or name
+        if not key:
+            continue
+        date = row["_Date"]
+        if key not in result or date > result[key]:
+            result[key] = date
+    return result
+
+
+def athlete_attention_rows(athlete_df: pd.DataFrame, history_df: pd.DataFrame) -> list[dict[str, str]]:
+    last_map = athlete_last_result_map(history_df)
+    dated = history_with_dates(history_df)
+    latest_date = dated["_Date"].max() if not dated.empty else pd.NaT
+    rows: list[dict[str, str]] = []
+    for _, athlete in athlete_df.iterrows():
+        aid = clean(athlete.get("Athlete ID", ""))
+        name = clean(athlete.get("Name", ""))
+        key = aid or name.casefold()
+        last = last_map.get(key)
+        if last is None:
+            rows.append({
+                "Athlete ID": aid, "Name": name, "Position": clean(athlete.get("Position", "")),
+                "Reason": "No verified track evidence", "Last Result": "—"
+            })
+        elif pd.notna(latest_date) and (latest_date - last).days >= 30:
+            rows.append({
+                "Athlete ID": aid, "Name": name, "Position": clean(athlete.get("Position", "")),
+                "Reason": "No verified result in 30+ days", "Last Result": last.strftime("%Y-%m-%d")
+            })
+    return rows
+
+
+def render_compact_result(row: pd.Series, key_prefix: str) -> None:
+    aid = clean(row.get("Athlete ID", ""))
+    name = clean(row.get("Name", ""))
+    event = clean(row.get("Event", ""))
+    mark = clean(row.get("Mark", ""))
+    meet = clean(row.get("Meet", ""))
+    date = clean(row.get("Meet Date", ""))
+    tags = []
+    if truthy_flag(row.get("PB", "")):
+        tags.append("PB")
+    if truthy_flag(row.get("SB", "")):
+        tags.append("SB")
+    tag_text = " · ".join(tags)
+    with st.container(border=True):
+        left, right = st.columns([5, 1])
+        with left:
+            headline = " · ".join([x for x in [name, event, mark] if x])
+            st.markdown(f"**{headline or name}**")
+            details = " · ".join([x for x in [tag_text, meet, date] if x])
+            if details:
+                st.caption(details)
+        with right:
+            if aid and st.button("Open Profile", key=f"{key_prefix}_{aid}_{row.name}", use_container_width=True):
+                open_profile(aid)
+                st.rerun()
+
+
 def open_profile(athlete_id: str) -> None:
     st.session_state["selected_athlete_id"] = athlete_id
     st.session_state["_next_workspace"] = "Player Profiles"
@@ -452,7 +556,7 @@ alerts = snapshot_alerts(payload)
 
 with st.sidebar:
     st.markdown("### Nevada Football")
-    st.caption("Recruiting Intelligence · Step 9.5")
+    st.caption("Recruiting Intelligence · Step 9.6")
     if "_next_workspace" in st.session_state:
         st.session_state["workspace"] = st.session_state.pop("_next_workspace")
     if "workspace" not in st.session_state:
@@ -467,7 +571,7 @@ with st.sidebar:
     position_filter = st.multiselect("Position filter", positions)
     states = sorted([x for x in athletes["State"].unique().tolist() if clean(x)])
     state_filter = st.multiselect("State filter", states)
-    st.caption("Step 9.3 web operations. Verified performance history remains protected by the stable tracker pipeline.")
+    st.caption("Step 9.6 recruiting operations. Verified performance history remains protected by the stable tracker pipeline.")
 
 filtered = athletes.copy()
 if position_filter:
@@ -486,28 +590,104 @@ st.markdown('<div class="nv-title">Nevada Football Recruiting Intelligence</div>
 st.markdown('<div class="nv-sub">Track evidence, development and weekly recruiting operations.</div>', unsafe_allow_html=True)
 
 if page == "Operations":
-    c1,c2,c3,c4=st.columns(4)
-    c1.metric("Tracked Athletes",len(athletes)); c2.metric("Verified Athletes",len(set(athletes["Athlete ID"]) & verified_ids))
-    c3.metric("Verified Performances",len(history)); c4.metric("Current Alerts",len(alerts))
-    st.subheader("Recruiting Operations Board")
-    st.caption("Verified track evidence is supporting recruiting context—not an overall player grade.")
-    for i,(_,r) in enumerate(filtered.iterrows()):
-        aid=clean(r["Athlete ID"])
-        ev=event_bests[event_bests["Athlete ID"].astype(str)==aid] if "Athlete ID" in event_bests.columns else pd.DataFrame()
-        with st.container(border=True):
-            x,y=st.columns([5,1])
-            with x:
-                st.markdown(f"**{clean(r['Name'])}** · {clean(r['Position'])} — {clean(r['School'])}, {clean(r['State'])}")
-                st.caption(("VERIFIED · "+best_marks(ev)) if aid in verified_ids else "NO VERIFIED TRACK EVIDENCE")
-                st.write(trait_summary(trait_rows,aid))
-            with y:
-                if st.button("Open Profile",key=f"ops_{aid}",use_container_width=True):
-                    open_profile(aid); st.rerun()
-    st.subheader("Weekly Change")
-    if alerts: st.dataframe(pd.DataFrame(alerts),use_container_width=True,hide_index=True)
-    else: st.info("No new recruiting alerts since the current intelligence snapshot.")
+    dated_history = history_with_dates(history)
+    latest_verified_date = dated_history["_Date"].max() if not dated_history.empty else pd.NaT
+    standouts = recent_standouts(history, limit=6)
+    recent_results = recent_verified_results(history, limit=8)
+    attention = athlete_attention_rows(filtered, history)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Tracked Athletes", len(athletes))
+    c2.metric("Verified Athletes", len(set(athletes["Athlete ID"]) & verified_ids))
+    c3.metric("Verified Performances", len(history))
+    c4.metric("Current Alerts", len(alerts))
+
+    st.subheader("Recruiting Operations")
+    st.caption(
+        "A staff-first view of verified track evidence. PB/SB flags and tracker alerts come from the existing "
+        "verified pipeline; this dashboard does not create an overall player grade."
+    )
+
+    left, right = st.columns([1.35, 1])
+
+    with left:
+        st.markdown("### Recent Standouts")
+        if standouts.empty:
+            st.info("No verified PB/SB performances are available yet.")
+        else:
+            for _, result in standouts.iterrows():
+                render_compact_result(result, "standout")
+
+    with right:
+        st.markdown("### Staff Attention")
+        if not attention:
+            st.success("Every athlete in the current view has recent verified track evidence.")
+        else:
+            for item in attention[:6]:
+                with st.container(border=True):
+                    x, y = st.columns([5, 1])
+                    with x:
+                        st.markdown(f"**{item['Name']}** · {item['Position']}")
+                        st.caption(f"{item['Reason']} · Last result: {item['Last Result']}")
+                    with y:
+                        if item["Athlete ID"] and st.button(
+                            "Open Profile",
+                            key=f"attention_{item['Athlete ID']}",
+                            use_container_width=True,
+                        ):
+                            open_profile(item["Athlete ID"])
+                            st.rerun()
+            if len(attention) > 6:
+                st.caption(f"+ {len(attention) - 6} more athletes need attention.")
+
+    st.markdown("### Position Rooms")
+    room_positions = sorted([x for x in filtered["Position"].unique().tolist() if clean(x)])
+    if not room_positions:
+        st.info("No position groups match the current filters.")
+    else:
+        room_cols = st.columns(min(4, len(room_positions)))
+        for i, pos in enumerate(room_positions):
+            room = filtered[filtered["Position"] == pos]
+            room_ids = set(room["Athlete ID"].astype(str))
+            verified_count = len(room_ids & verified_ids)
+            with room_cols[i % len(room_cols)]:
+                with st.container(border=True):
+                    st.markdown(f"### {pos}")
+                    st.metric("Recruits", len(room))
+                    st.caption(f"{verified_count} with verified track evidence")
+                    names = ", ".join(room["Name"].astype(str).tolist()[:4])
+                    if names:
+                        st.write(names)
+                    if len(room) > 4:
+                        st.caption(f"+ {len(room) - 4} more")
+
+    st.markdown("### What Changed")
+    st.caption(
+        "Tracker-generated alerts from the persistent recruiting-intelligence snapshot. "
+        "This is the primary run-to-run change feed."
+    )
+    if alerts:
+        st.dataframe(pd.DataFrame(alerts), use_container_width=True, hide_index=True)
+    else:
+        st.info("No new recruiting alerts since the current intelligence snapshot.")
+
+    st.markdown("### Latest Verified Results")
+    if recent_results.empty:
+        st.info("No verified performances are stored yet.")
+    else:
+        cols = [c for c in ["Meet Date", "Name", "Position", "Event", "Mark", "PB", "SB", "Meet"] if c in recent_results.columns]
+        st.dataframe(recent_results[cols], use_container_width=True, hide_index=True)
+
+    if pd.notna(latest_verified_date):
+        st.caption(f"Latest verified performance in the database: {latest_verified_date.strftime('%Y-%m-%d')}")
+
     if WEEKLY_REPORT.exists():
-        st.download_button("Download weekly Excel report",WEEKLY_REPORT.read_bytes(),"weekly_track_report.xlsx","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button(
+            "Download weekly Excel report",
+            WEEKLY_REPORT.read_bytes(),
+            "weekly_track_report.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 elif page == "Recruiting Board":
     st.subheader("Recruiting Board")
@@ -748,11 +928,11 @@ elif page == "Manage Athletes":
         data=roster_master_xlsx(athletes),
         file_name="2026 Nevada Track.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help="Use this file as the local tracker's master workbook until the tracker itself is moved into the web app.",
+        help="Download a copy of the current private recruiting roster.",
     )
     st.info(
-        "The web roster updates immediately. For the current local Step 8.4 result-discovery run, "
-        "download the tracker master workbook above and replace the local 2026 Nevada Track.xlsx before running py run_tracker.py."
+        "The private web roster updates immediately. When you are ready, open Tracker Control and click "
+        "Run Recruiting Tracker; the cloud runner will use this roster automatically."
     )
 
 elif page == "Performance History":
