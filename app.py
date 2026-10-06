@@ -238,6 +238,73 @@ def save_roster_to_private_storage(roster: pd.DataFrame) -> None:
     (DATA_DIR / "athletes.csv").write_bytes(csv_bytes)
     load_athletes.clear()
 
+def github_tracker_settings() -> tuple[str, str, str, str]:
+    try:
+        owner = str(st.secrets.get("GITHUB_TRACKER_OWNER", "adarmond"))
+        repo = str(st.secrets.get("GITHUB_TRACKER_REPO", "track"))
+        workflow = str(st.secrets.get("GITHUB_TRACKER_WORKFLOW", "run-tracker.yml"))
+        token = str(st.secrets["GITHUB_TRACKER_TOKEN"])
+        return owner, repo, workflow, token
+    except Exception as exc:
+        raise RuntimeError(f"GitHub tracker control is not configured: {exc}")
+
+
+def github_headers() -> dict[str, str]:
+    _, _, _, token = github_tracker_settings()
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def request_tracker_run() -> None:
+    owner, repo, workflow, _ = github_tracker_settings()
+    endpoint = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow}/dispatches"
+    response = requests.post(
+        endpoint,
+        headers=github_headers(),
+        json={"ref": "main"},
+        timeout=30,
+    )
+    if response.status_code != 204:
+        raise RuntimeError(
+            f"GitHub did not accept the run request (HTTP {response.status_code}): "
+            f"{response.text[:300]}"
+        )
+
+
+def latest_tracker_run() -> dict[str, Any] | None:
+    owner, repo, workflow, _ = github_tracker_settings()
+    endpoint = f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/{workflow}/runs"
+    response = requests.get(
+        endpoint,
+        headers=github_headers(),
+        params={"branch": "main", "per_page": 1},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Could not read tracker status (HTTP {response.status_code}): "
+            f"{response.text[:300]}"
+        )
+    runs = response.json().get("workflow_runs", [])
+    return runs[0] if runs else None
+
+
+def github_run_is_active(run: dict[str, Any] | None) -> bool:
+    return bool(run and run.get("status") in {"queued", "in_progress", "waiting", "pending"})
+
+
+def format_github_time(value: Any) -> str:
+    raw = clean(value)
+    if not raw:
+        return "—"
+    try:
+        return pd.to_datetime(raw, utc=True).tz_convert("US/Pacific").strftime("%Y-%m-%d %I:%M %p PT")
+    except Exception:
+        return raw
+
 def find_athlete_file() -> Path | None:
     candidates = [
         DATA_DIR / "athletes.csv",
@@ -385,14 +452,14 @@ alerts = snapshot_alerts(payload)
 
 with st.sidebar:
     st.markdown("### Nevada Football")
-    st.caption("Recruiting Intelligence · Step 9.3")
+    st.caption("Recruiting Intelligence · Step 9.5")
     if "_next_workspace" in st.session_state:
         st.session_state["workspace"] = st.session_state.pop("_next_workspace")
     if "workspace" not in st.session_state:
         st.session_state["workspace"] = "Operations"
     page = st.radio(
         "Workspace",
-        ["Operations", "Recruiting Board", "Player Profiles", "Position Rooms", "Weekly Alerts", "Performance History", "Manage Athletes"],
+        ["Operations", "Recruiting Board", "Player Profiles", "Position Rooms", "Weekly Alerts", "Performance History", "Manage Athletes", "Tracker Control"],
         label_visibility="collapsed", key="workspace",
     )
     st.divider()
@@ -524,6 +591,83 @@ elif page == "Weekly Alerts":
         st.dataframe(pd.DataFrame(alerts), use_container_width=True, hide_index=True)
     else:
         st.success("No new recruiting alerts in the current snapshot.")
+
+elif page == "Tracker Control":
+    st.subheader("Tracker Control")
+    st.caption(
+        "Run the private recruiting tracker in GitHub Actions. "
+        "The cloud runner pulls the private Supabase roster/history, runs the existing Step 8.4 engine, "
+        "and publishes refreshed results back to Supabase."
+    )
+
+    try:
+        run = latest_tracker_run()
+        active = github_run_is_active(run)
+
+        if run:
+            status = clean(run.get("status")).replace("_", " ").title()
+            conclusion = clean(run.get("conclusion")).replace("_", " ").title()
+            display_status = conclusion if status == "Completed" and conclusion else status
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Latest run", display_status or "Unknown")
+            c2.metric("Started", format_github_time(run.get("run_started_at") or run.get("created_at")))
+            c3.metric("Run number", f"#{run.get('run_number', '—')}")
+
+            if active:
+                st.info("A tracker run is currently active. A second run is disabled until it finishes.")
+            elif clean(run.get("conclusion")) == "success":
+                st.success("The latest cloud tracker run completed successfully.")
+            elif clean(run.get("conclusion")):
+                st.error(f"The latest cloud tracker run ended with: {clean(run.get('conclusion'))}")
+
+        else:
+            active = False
+            st.info("No Step 9.5 cloud tracker runs have been recorded yet.")
+
+        if st.button(
+            "Run Recruiting Tracker",
+            type="primary",
+            disabled=active,
+            use_container_width=True,
+        ):
+            request_tracker_run()
+            st.session_state["_tracker_requested"] = True
+            st.rerun()
+
+        if st.session_state.pop("_tracker_requested", False):
+            st.success("Tracker run requested. Use Refresh status below in a few seconds.")
+
+        refresh_col, data_col = st.columns(2)
+        with refresh_col:
+            if st.button("Refresh Run Status", use_container_width=True):
+                st.rerun()
+        with data_col:
+            if st.button("Refresh Website Data", use_container_width=True):
+                refresh_private_web_data()
+                st.session_state["_website_data_refreshed"] = True
+                st.rerun()
+
+        if st.session_state.pop("_website_data_refreshed", False):
+            st.success("Website data refreshed from private Supabase storage.")
+
+        if run and clean(run.get("status")) == "completed" and clean(run.get("conclusion")) == "success":
+            st.caption(
+                "After a successful run, click Refresh Website Data to immediately reload the newly "
+                "published roster, history, intelligence snapshot, and weekly report."
+            )
+
+        st.caption(
+            "The website only requests and monitors the private GitHub Actions job. "
+            "The GitHub token and Supabase credentials stay in server-side secrets and are not sent to the browser."
+        )
+
+    except Exception as exc:
+        st.error(str(exc))
+        st.info(
+            "Step 9.5 requires GITHUB_TRACKER_TOKEN in Streamlit Secrets and the private track repository "
+            "to contain the Step 9.5 workflow."
+        )
 
 elif page == "Manage Athletes":
     st.subheader("Manage Athletes")
