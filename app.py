@@ -24,7 +24,7 @@ WEEKLY_REPORT = REPORTS_DIR / "weekly_track_report.xlsx"
 
 
 st.set_page_config(
-    page_title="Nevada Football Track",
+    page_title="Nevada Football Recruiting Intelligence",
     page_icon="🏈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -541,6 +541,91 @@ def athlete_attention_rows(athlete_df: pd.DataFrame, history_df: pd.DataFrame) -
     return rows
 
 
+def matching_history_for_athlete(athlete: pd.Series, history_df: pd.DataFrame) -> pd.DataFrame:
+    if history_df.empty:
+        return history_df.copy()
+    aid = normalized_identity_text(athlete.get("Athlete ID", ""))
+    name = normalized_identity_text(athlete.get("Name", ""))
+    school = normalized_identity_text(athlete.get("School", ""))
+    if aid and "Athlete ID" in history_df.columns:
+        matched = history_df[history_df["Athlete ID"].map(normalized_identity_text) == aid]
+        if not matched.empty:
+            return matched.copy()
+    if name and "Name" in history_df.columns:
+        name_mask = history_df["Name"].map(normalized_identity_text) == name
+        if school and "School" in history_df.columns:
+            strong = history_df[name_mask & (history_df["School"].map(normalized_identity_text) == school)]
+            if not strong.empty:
+                return strong.copy()
+        return history_df[name_mask].copy()
+    return history_df.iloc[0:0].copy()
+
+def best_mark_summary(athlete_history: pd.DataFrame, limit: int = 4) -> list[str]:
+    if athlete_history.empty or "Event" not in athlete_history.columns:
+        return []
+    rows=[]
+    for event, group in athlete_history.groupby("Event", dropna=True):
+        event_name=clean(event)
+        if not event_name: continue
+        pb_group=group[group["PB"].map(truthy_flag)] if "PB" in group.columns else group.iloc[0:0]
+        candidate=pb_group.iloc[-1] if not pb_group.empty else group.iloc[-1]
+        mark=clean(candidate.get("Mark",""))
+        if mark: rows.append(f"{event_name}: {mark}")
+        if len(rows)>=limit: break
+    return rows
+
+def football_trait_summary(athlete: pd.Series, traits_df: pd.DataFrame) -> str:
+    if traits_df.empty: return "No verified football-trait evidence yet"
+    aid=normalized_identity_text(athlete.get("Athlete ID",""))
+    name=normalized_identity_text(athlete.get("Name",""))
+    matches=traits_df.iloc[0:0]
+    if aid and "Athlete ID" in traits_df.columns:
+        matches=traits_df[traits_df["Athlete ID"].map(normalized_identity_text)==aid]
+    if matches.empty and name and "Name" in traits_df.columns:
+        matches=traits_df[traits_df["Name"].map(normalized_identity_text)==name]
+    if matches.empty: return "No verified football-trait evidence yet"
+    row=matches.iloc[0]
+    pieces=[]
+    for col in ["Primary Trait","Football Trait","Trait","Trait Summary","Speed","Explosiveness","Power","Speed Endurance"]:
+        if col in matches.columns:
+            value=clean(row.get(col,""))
+            if value and value.casefold() not in {"nan","none","0","false"}:
+                pieces.append(f"{col}: {value}")
+    return " · ".join(pieces[:3]) if pieces else "Verified track evidence on file"
+
+def evidence_freshness(athlete_history: pd.DataFrame, reference_date: pd.Timestamp) -> tuple[str,str]:
+    dated=history_with_dates(athlete_history)
+    valid=dated["_Date"].dropna() if not dated.empty else pd.Series(dtype="datetime64[ns]")
+    if valid.empty: return "NO EVIDENCE","No verified result"
+    last=valid.max()
+    age=(reference_date-last).days if pd.notna(reference_date) else 0
+    status="CURRENT" if age<=14 else ("WATCH" if age<=30 else "STALE")
+    return status,f"Last verified: {last.strftime('%Y-%m-%d')}"
+
+def render_position_room_card(athlete: pd.Series, history_df: pd.DataFrame, traits_df: pd.DataFrame, reference_date: pd.Timestamp, key_prefix: str) -> None:
+    aid=clean(athlete.get("Athlete ID","")); name=clean(athlete.get("Name",""))
+    school=clean(athlete.get("School","")); state=clean(athlete.get("State","")); pos=clean(athlete.get("Position",""))
+    ah=matching_history_for_athlete(athlete,history_df)
+    freshness,last_text=evidence_freshness(ah,reference_date)
+    marks=best_mark_summary(ah); trait_text=football_trait_summary(athlete,traits_df)
+    with st.container(border=True):
+        top,action=st.columns([5,1.5])
+        with top:
+            st.markdown(f"### {name}")
+            location=" · ".join([x for x in [pos,school,state] if x])
+            if location: st.caption(location)
+        with action:
+            if aid and st.button("Open Profile",key=f"{key_prefix}_{aid}",use_container_width=True):
+                open_profile(aid); st.rerun()
+        m1,m2,m3=st.columns(3)
+        m1.metric("Evidence",len(ah))
+        m2.metric("PB Marks",int(ah["PB"].map(truthy_flag).sum()) if "PB" in ah.columns else 0)
+        m3.metric("Freshness",freshness)
+        st.caption(last_text)
+        st.markdown("**Verified bests:** "+" · ".join(marks) if marks else "**Verified bests:** No verified marks stored yet.")
+        st.markdown(f"**Football translation:** {trait_text}")
+
+
 def render_compact_result(row: pd.Series, key_prefix: str) -> None:
     aid = clean(row.get("Athlete ID", ""))
     name = clean(row.get("Name", ""))
@@ -610,7 +695,7 @@ alerts = snapshot_alerts(payload)
 
 with st.sidebar:
     st.markdown("### Nevada Football")
-    st.caption("Recruiting Intelligence · Step 9.6.1")
+    st.caption("Recruiting Intelligence · Step 9.6.2")
     if "_next_workspace" in st.session_state:
         st.session_state["workspace"] = st.session_state.pop("_next_workspace")
     if "workspace" not in st.session_state:
@@ -625,7 +710,7 @@ with st.sidebar:
     position_filter = st.multiselect("Position filter", positions)
     states = sorted([x for x in athletes["State"].unique().tolist() if clean(x)])
     state_filter = st.multiselect("State filter", states)
-    st.caption("Step 9.6.1 recruiting operations. Verified performance history remains protected by the stable tracker pipeline.")
+    st.caption("Step 9.6.2 recruiting operations. Verified performance history remains protected by the stable tracker pipeline.")
 
 filtered = athletes.copy()
 if position_filter:
@@ -709,6 +794,10 @@ if page == "Operations":
                         st.write(names)
                     if len(room) > 4:
                         st.caption(f"+ {len(room) - 4} more")
+                    if st.button("Open Position Room", key=f"open_room_{pos}", use_container_width=True):
+                        st.session_state["_position_room"] = pos
+                        st.session_state["_next_workspace"] = "Position Rooms"
+                        st.rerun()
 
     st.markdown("### What Changed")
     st.caption(
@@ -798,20 +887,33 @@ elif page == "Player Profiles":
             st.dataframe(view,use_container_width=True,hide_index=True)
 
 elif page == "Position Rooms":
-    st.subheader("Position Rooms")
+    st.subheader("Position Room Recruiting Boards")
+    st.caption("Review each football position as a recruiting room: verified track evidence, best marks, evidence freshness, football-trait translation and direct player navigation.")
+
     room_positions = sorted([x for x in filtered["Position"].unique().tolist() if clean(x)])
     if not room_positions:
         st.info("No position groups match the current filters.")
-    for pos in room_positions:
-        room = filtered[filtered["Position"] == pos]
-        st.markdown(f"### {pos} · {len(room)}")
-        for _, a in room.iterrows():
-            aid = clean(a["Athlete ID"])
-            ev = event_bests[event_bests["Athlete ID"].astype(str) == aid] if "Athlete ID" in event_bests.columns else pd.DataFrame()
-            with st.container(border=True):
-                st.markdown(f"**{clean(a['Name'])}** — {clean(a['School'])}, {clean(a['State'])}")
-                st.caption(("VERIFIED · " + best_marks(ev)) if aid in verified_ids else "NO VERIFIED TRACK EVIDENCE")
-                st.write(trait_summary(trait_rows, aid))
+    else:
+        default_pos = st.session_state.get("_position_room", room_positions[0])
+        if default_pos not in room_positions:
+            default_pos = room_positions[0]
+        selected_pos = st.selectbox("Position room", room_positions, index=room_positions.index(default_pos))
+        st.session_state["_position_room"] = selected_pos
+
+        room = filtered[filtered["Position"] == selected_pos].copy()
+        room_verified = verified_athlete_ids(room, history)
+        dated_all = history_with_dates(history)
+        reference_date = dated_all["_Date"].max() if not dated_all.empty else pd.NaT
+
+        a, b, c = st.columns(3)
+        a.metric(f"{selected_pos} Recruits", len(room))
+        b.metric("With Verified Evidence", len(room_verified))
+        c.metric("Need Evidence", max(len(room) - len(room_verified), 0))
+
+        st.markdown(f"### {selected_pos} Room")
+        for _, athlete in room.sort_values(["Name"]).iterrows():
+            render_position_room_card(athlete, history, traits, reference_date, f"room_{selected_pos}")
+
 
 elif page == "Weekly Alerts":
     st.subheader("Weekly Alerts")
