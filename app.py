@@ -695,7 +695,7 @@ alerts = snapshot_alerts(payload)
 
 with st.sidebar:
     st.markdown("### Nevada Football")
-    st.caption("Recruiting Intelligence · Step 9.6.2")
+    st.caption("Recruiting Intelligence · Step 9.6.2.1")
     if "_next_workspace" in st.session_state:
         st.session_state["workspace"] = st.session_state.pop("_next_workspace")
     if "workspace" not in st.session_state:
@@ -710,7 +710,7 @@ with st.sidebar:
     position_filter = st.multiselect("Position filter", positions)
     states = sorted([x for x in athletes["State"].unique().tolist() if clean(x)])
     state_filter = st.multiselect("State filter", states)
-    st.caption("Step 9.6.2 recruiting operations. Verified performance history remains protected by the stable tracker pipeline.")
+    st.caption("Step 9.6.2.1 recruiting operations. Verified performance history remains protected by the stable tracker pipeline.")
 
 filtered = athletes.copy()
 if position_filter:
@@ -912,7 +912,7 @@ elif page == "Position Rooms":
 
         st.markdown(f"### {selected_pos} Room")
         for _, athlete in room.sort_values(["Name"]).iterrows():
-            render_position_room_card(athlete, history, traits, reference_date, f"room_{selected_pos}")
+            render_position_room_card(athlete, history, trait_rows, reference_date, f"room_{selected_pos}")
 
 
 elif page == "Weekly Alerts":
