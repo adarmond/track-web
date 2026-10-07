@@ -619,7 +619,8 @@ def render_position_room_card(athlete: pd.Series, history_df: pd.DataFrame, trai
                 open_profile(aid); st.rerun()
         m1,m2,m3=st.columns(3)
         m1.metric("Evidence",len(ah))
-        m2.metric("PB Marks",int(ah["PB"].map(truthy_flag).sum()) if "PB" in ah.columns else 0)
+        pb_count = int(ah["PB"].map(truthy_flag).sum()) if "PB" in ah.columns else 0
+        m2.metric("PB Marks", pb_count)
         m3.metric("Freshness",freshness)
         st.caption(last_text)
         st.markdown("**Verified bests:** "+" · ".join(marks) if marks else "**Verified bests:** No verified marks stored yet.")
@@ -695,7 +696,7 @@ alerts = snapshot_alerts(payload)
 
 with st.sidebar:
     st.markdown("### Nevada Football")
-    st.caption("Recruiting Intelligence · Step 9.6.2.1")
+    st.caption("Recruiting Intelligence · Step 9.6.2.2")
     if "_next_workspace" in st.session_state:
         st.session_state["workspace"] = st.session_state.pop("_next_workspace")
     if "workspace" not in st.session_state:
@@ -710,7 +711,7 @@ with st.sidebar:
     position_filter = st.multiselect("Position filter", positions)
     states = sorted([x for x in athletes["State"].unique().tolist() if clean(x)])
     state_filter = st.multiselect("State filter", states)
-    st.caption("Step 9.6.2.1 recruiting operations. Verified performance history remains protected by the stable tracker pipeline.")
+    st.caption("Step 9.6.2.2 recruiting operations. Verified performance history remains protected by the stable tracker pipeline.")
 
 filtered = athletes.copy()
 if position_filter:
